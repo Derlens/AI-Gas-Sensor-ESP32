@@ -1,0 +1,336 @@
+//Libraries
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#include <SPI.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <MQUnifiedsensor.h>
+
+//AI Headers
+#include <autoencoder_model_data.h>
+#include <classification_model_data.h>
+#include <regression_model_data.h>
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+
+/*Pinout to ESP32 for SD card
+CS    = 5;
+MOSI  = 23;
+MISO  = 19;
+SCK   = 18; 
+*/
+
+//Initialized/defined variables
+#define sensorPin 34
+#define buzzerPin 21
+#define redPin 32
+#define bluePin 33
+#define buttonUp 16
+#define buttonDown 17
+#define buttonSelect 4
+
+//MQUnifiedSensor Definitions
+#define placa "ESP32"
+#define Voltage_Resolution 5
+#define pin 34 //Analog input 0 of your arduino
+#define type "MQ-135" //MQ135
+#define ADC_Bit_Resolution 12 // For arduino UNO/MEGA/NANO/ 12 for ESP32
+#define RatioMQ135CleanAir 3.6//RS / R0 = 3.6 ppm  
+//#define calibration_button 13 //Pin to calibrate your sensor
+
+
+//Gas Sensor Variable
+int MQValues;
+
+float classificationOutput[1];
+float classificationInput[1];
+float regressionInput[1];
+float regressionOutput[1];
+float autoencoderInput[1];
+float autoencoderOutput[1];
+constexpr int kTensorArenaSize = 10 * 1024;  // Adjust size as needed
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];  // Memory for tensors
+
+
+// Create An LCD Object. Signals: [ RS, EN, D4, D5, D6, D7 ]
+LiquidCrystal My_LCD(13, 12, 14, 27, 26, 25);
+
+
+//SD Card and File Operations
+//File myFile;
+//const int CS = 5;
+
+
+//AI Variables & Functions
+tflite::MicroInterpreter classificationInterpreter;
+tflite::MicroInterpreter regressionInterpreter;
+tflite::MicroInterpreter autoencoderInterpreter;
+
+
+void setupClassificationModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+  resolver.AddLogistic();
+  
+  const tflite::Model* model = tflite::GetModel(classification_model_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+      Serial.println("Model schema version mismatch!");
+      return;
+  }
+
+  static tflite::MicroInterpreter classificationInterpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+  
+      classificationInterpreter.AllocateTensors();
+}
+
+void setupRegressionModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+
+  const tflite::Model* model = tflite::GetModel(regression_model_tflite);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.println("Model schema version mismatch!");
+        return;
+    }
+
+    static tflite::MicroInterpreter regressionInterpreter(
+        model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+
+  regressionInterpreter.AllocateTensors();
+}
+
+void setupAutoencoderModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+  
+  const tflite::Model* model = tflite::GetModel(autoencoder_model_tflite);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.println("Model schema version mismatch!");
+        return;
+    }
+
+    static tflite::MicroInterpreter autoencoderInterpreter(
+        model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+
+  autoencoderInterpreter.AllocateTensors();
+}
+
+//MQUnified Function
+MQUnifiedsensor MQ135(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, type);
+
+/*File Operations
+void WriteFile(const char * path, const char * message){
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  myFile = SD.open(path, FILE_WRITE);
+  // if the file opened okay, write to it:
+  if (myFile) {
+    Serial.printf("Writing to %s ", path);
+    myFile.println(message);
+    myFile.close(); // close the file:
+    Serial.println("Completed.");
+  } 
+  // if the file didn't open, print an error:
+  else {
+    Serial.println("Error opening file.");
+    Serial.println(path);
+  }
+}
+
+void ReadFile(const char * path){
+  // open the file for reading:
+  myFile = SD.open(path);
+  if (myFile) {
+     Serial.printf("Reading file from %s\n", path);
+     // read from the file until there's nothing else in it:
+    while (myFile.available()) {
+      Serial.write(myFile.read());
+    }
+    myFile.close(); // close the file:
+  } 
+  else {
+    // if the file didn't open, print an error:
+    Serial.println("Error opening logs.txt");
+  }
+}
+*/
+
+void setup() {
+  Serial.begin(9600);  // Start serial communication at 9600 baud rate
+
+  //Set math model to calculate the PPM concentration and the value of constants
+  MQ135.setRegressionMethod(1); //_PPM =  a*ratio^b
+  MQ135.setA(102.2); MQ135.setB(-2.473); // Configure the equation to to calculate NH4 concentration
+
+  /*
+    Exponential regression:
+  GAS      | a      | b
+  CO       | 605.18 | -3.937  
+  Alcohol  | 77.255 | -3.18 
+  CO2      | 110.47 | -2.862
+  Toluen  | 44.947 | -3.445
+  NH4      | 102.2  | -2.473
+  Aceton  | 34.668 | -3.369
+  */
+  
+  /*****************************  MQ Init ********************************************/ 
+  //Remarks: Configure the pin of arduino as input.
+  /************************************************************************************/ 
+  MQ135.init(); 
+  /* 
+    //If the RL value is different from 10K please assign your RL value with the following method:
+    MQ135.setRL(10);
+  */
+  /*****************************  MQ CAlibration ********************************************/ 
+  // Explanation: 
+   // In this routine the sensor will measure the resistance of the sensor supposedly before being pre-heated
+  // and on clean air (Calibration conditions), setting up R0 value.
+  // We recomend executing this routine only on setup in laboratory conditions.
+  // This routine does not need to be executed on each restart, you can load your R0 value from eeprom.
+  // Acknowledgements: https://jayconsystems.com/blog/understanding-a-gas-sensor
+  Serial.print("Calibrating please wait.");
+  float calcR0 = 0;
+  for(int i = 1; i<=10; i ++)
+  {
+    MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+    calcR0 += MQ135.calibrate(RatioMQ135CleanAir);
+    Serial.print(".");
+  }
+  MQ135.setR0(calcR0/10);
+  Serial.println("  done!.");
+  
+  if(isinf(calcR0)) {Serial.println("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); while(1);}
+  if(calcR0 == 0){Serial.println("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); while(1);}
+  /*****************************  MQ CAlibration ********************************************/ 
+  Serial.println("** Values from MQ-135 ****");
+  Serial.println("|    CO   |  Alcohol |   CO2  |  Toluen  |  NH4  |  Aceton  |");  
+  
+  // Initialize the buzzer and LED pins as output
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+
+  // Initialize The LCD. Parameters: [ Columns, Rows ] 
+  My_LCD.begin(16, 2); 
+  // Clears The LCD Display 
+  My_LCD.clear();
+  // Display The First Message In Home Position (0, 0) 
+ /* My_LCD.print("Initializing");
+  My_LCD.setCursor(0, 1); 
+  My_LCD.print("device...");*/
+
+  //Initialize LEDs and Buzzer
+  digitalWrite(bluePin, HIGH);
+  digitalWrite(redPin, HIGH);
+  tone(buzzerPin, 180, 500);
+
+ /* //Initialize WiFi AP
+  My_LCD.print("Setting up");
+  My_LCD.setCursor(0,1);
+  My_LCD.print("wireless AP...");
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  My_LCD.print("AP IP address: ");
+  My_LCD.setCursor(0,1);
+  My_LCD.println(IP);
+  server.begin();*/
+ 
+  //Initialize SD Card module.
+ /* while (!Serial) { ; }  // wait for serial port to connect. Needed for native USB port only
+  Serial.println("Initializing SD card...");
+  if (!SD.begin(CS)) {
+    Serial.println("Initialization failed!");
+    return;
+  }
+  Serial.println("Initialization done.");
+*/
+
+  delay(5000);
+  My_LCD.clear();
+}
+
+void loop() {
+
+  MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+
+  MQ135.setA(605.18); MQ135.setB(-3.937); // Configure the equation to calculate CO concentration value
+  float CO = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(77.255); MQ135.setB(-3.18); //Configure the equation to calculate Alcohol concentration value
+  float Alcohol = MQ135.readSensor(); // SSensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(110.47); MQ135.setB(-2.862); // Configure the equation to calculate CO2 concentration value
+  float CO2 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(44.947); MQ135.setB(-3.445); // Configure the equation to calculate Toluen concentration value
+  float Toluen = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  
+  MQ135.setA(102.2 ); MQ135.setB(-2.473); // Configure the equation to calculate NH4 concentration value
+  float NH4 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(34.668); MQ135.setB(-3.369); // Configure the equation to calculate Aceton concentration value
+  float Aceton = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  Serial.print("|   "); Serial.print(CO); 
+  Serial.print("   |   "); Serial.print(Alcohol);
+  // Note: 400 Offset for CO2 source: https://github.com/miguel5612/MQSensorsLib/issues/29
+  /*
+  Motivation:
+  We have added 400 PPM because when the library is calibrated it assumes the current state of the
+  air as 0 PPM, and it is considered today that the CO2 present in the atmosphere is around 400 PPM.
+  https://www.lavanguardia.com/natural/20190514/462242832581/concentracion-dioxido-cabono-co2-atmosfera-bate-record-historia-humanidad.html
+  */
+  Serial.print("   |   "); Serial.print(CO2 + 400); 
+  Serial.print("   |   "); Serial.print(Toluen); 
+  Serial.print("   |   "); Serial.print(NH4); 
+  Serial.print("   |   "); Serial.print(Aceton);
+  Serial.println("   |"); 
+  /*
+    Exponential regression:
+  GAS      | a      | b
+  CO       | 605.18 | -3.937  
+  Alcohol  | 77.255 | -3.18 
+  CO2      | 110.47 | -2.862
+  Toluen  | 44.947 | -3.445
+  NH4      | 102.2  | -2.473
+  Aceton  | 34.668 | -3.369
+  */
+
+
+//Old analog readings  
+/*
+  MQValues = analogRead(sensorPin);
+  Serial.print("Analog output: ");
+  Serial.println(MQValues);  // Read the analog value of the gas sensor and print it to the serial monitor
+  My_LCD.clear();
+  My_LCD.print("Analog output: ");
+  My_LCD.setCursor(0,1);
+  My_LCD.print(MQValues);
+
+  // If the sensor value exceeds the threshold, trigger the alarm and make the RGB LED red
+  if (MQValues > 2000) {
+    tone(buzzerPin, 898, 50);
+    digitalWrite(bluePin, LOW);
+    digitalWrite(redPin, HIGH);
+    My_LCD.setCursor(8, 1);
+    My_LCD.print("WARNING!");
+  } else {
+    // If the sensor value is below the threshold, turn off the alarm and make the RGB LED blue
+    noTone(buzzerPin);
+    digitalWrite(redPin, LOW);
+    digitalWrite(bluePin, HIGH);
+  }*/
+  
+  delay(100);
+}

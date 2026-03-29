@@ -1,0 +1,233 @@
+// [AI Integration Version with DHT + Losant + Classification Labels]
+
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <SD.h>
+#include <RTClib.h>
+#include <MQUnifiedsensor.h>
+#include <DHT.h> // <-- Add DHT support
+
+// TensorFlow Lite
+#include <autoencoder_model_data.h>
+#include <classification_model_data.h>
+#include <regression_model_data.h>
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+
+const char* WIFI_SSID = "RafHive";
+const char* WIFI_PASSWORD = "thecatshowlatmidnight";
+const char* LOSANT_DEVICE_ID = "67bd0ffa3f887ddff7825328";
+const char* LOSANT_ACCESS_KEY = "7facce4e-3a59-42db-8cd3-e762afc819ee";
+const char* LOSANT_ACCESS_SECRET = "c0d758940a7d053d25e4ca9be95653b031f3b75c1dcacd0ddcfc1b12052eab28";
+
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+// AI Inference
+float classificationInput[3];
+float regressionInput[3];
+float autoencoderInput[3];
+constexpr int kTensorArenaSize = 10 * 1024;
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+tflite::MicroInterpreter* classificationInterpreter;
+tflite::MicroInterpreter* regressionInterpreter;
+tflite::MicroInterpreter* autoencoderInterpreter;
+
+const char* gasLabels[] = {"Ammonia", "Benzene", "Alcohol", "Smoke", "CO2", "CO", "VOC"};
+
+// Sensor Pins & Setup
+#define DHTPIN 4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+RTC_DS3231 rtc; // Real Time Clock
+
+const int buzzerPin = 4, redPin = 33, bluePin = 32;
+const int selButton = 25, upButton = 26, downButton = 27;
+File myFile; const int CS = 5;
+
+#define placa "ESP32"
+#define Voltage_Resolution 5
+#define pin 34
+#define type "MQ-135"
+#define ADC_Bit_Resolution 12
+#define RatioMQ135CleanAir 3.6
+MQUnifiedsensor MQ135(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, type);
+LiquidCrystal_I2C My_LCD(0x27, 16, 2);
+
+void setupClassificationModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected(); resolver.AddRelu(); resolver.AddLogistic();
+  const tflite::Model* model = tflite::GetModel(classification_model_tflite);
+  classificationInterpreter = new tflite::MicroInterpreter(model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+  classificationInterpreter->AllocateTensors();
+}
+
+void setupRegressionModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected(); resolver.AddRelu();
+  const tflite::Model* model = tflite::GetModel(regression_model_tflite);
+  regressionInterpreter = new tflite::MicroInterpreter(model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+  regressionInterpreter->AllocateTensors();
+}
+
+void setupAutoencoderModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected(); resolver.AddRelu();
+  const tflite::Model* model = tflite::GetModel(autoencoder_model_tflite);
+  autoencoderInterpreter = new tflite::MicroInterpreter(model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+  autoencoderInterpreter->AllocateTensors();
+}
+
+void connectToLosant() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  secureClient.setInsecure();
+  mqttClient.setServer("broker.losant.com", 8883);
+  while (!mqttClient.connected()) {
+    mqttClient.connect(LOSANT_DEVICE_ID, LOSANT_ACCESS_KEY, LOSANT_ACCESS_SECRET);
+    delay(1000);
+  }
+}
+
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 1000;
+
+void setup() {
+  My_LCD.init(); My_LCD.backlight(); My_LCD.clear();
+  My_LCD.print("Initializing");
+  Serial.begin(9600);
+  connectToLosant();
+
+  dht.begin();
+  rtc.begin();
+
+  SD.begin(CS);
+  myFile = SD.open("synthetic_mq135_gas_data.csv", FILE_WRITE);
+  myFile.println("Time, CO, Alcohol, CO2, Benzene, NH3, VOC, Classification, Regression, AE");
+  myFile.close();
+
+  MQ135.setRegressionMethod(1);
+  MQ135.setA(102.2); MQ135.setB(-2.473);
+  MQ135.init();
+  float calcR0 = 0;
+  for (int i = 0; i < 10; i++) { MQ135.update(); calcR0 += MQ135.calibrate(RatioMQ135CleanAir); }
+  MQ135.setR0(calcR0 / 10);
+
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  digitalWrite(bluePin, HIGH);
+
+  setupClassificationModel();
+  setupRegressionModel();
+  setupAutoencoderModel();
+}
+
+void loop() {
+  MQ135.update();
+  MQ135.setA(605.18); MQ135.setB(-3.937); float CO = MQ135.readSensor();
+  MQ135.setA(77.255); MQ135.setB(-3.18); float Alcohol = MQ135.readSensor();
+  MQ135.setA(110.47); MQ135.setB(-2.862); float CO2 = MQ135.readSensor() + 400;
+  MQ135.setA(44.947); MQ135.setB(-3.445); float Benzene = MQ135.readSensor();
+  MQ135.setA(102.2); MQ135.setB(-2.473); float NH3 = MQ135.readSensor();
+  MQ135.setA(34.668); MQ135.setB(-3.369); float VOC = MQ135.readSensor();
+
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  float analogReading = analogRead(pin);
+  float normalizedSensor = analogReading / 4095.0f;
+
+  // AI Inference
+  for (int i = 0; i < 3; i++) {
+    classificationInterpreter->input(0)->data.f[i] = i == 0 ? normalizedSensor : (i == 1 ? temperature : humidity);
+    regressionInterpreter->input(0)->data.f[i] = i == 0 ? normalizedSensor : (i == 1 ? temperature : humidity);
+    autoencoderInterpreter->input(0)->data.f[i] = i == 0 ? normalizedSensor : (i == 1 ? temperature : humidity);
+  }
+
+  classificationInterpreter->Invoke();
+  regressionInterpreter->Invoke();
+  autoencoderInterpreter->Invoke();
+
+  int classIndex = (int)(classificationInterpreter->output(0)->data.f[0] + 0.5);
+  const char* classLabel = gasLabels[classIndex % 7];
+  float regressionResult = regressionInterpreter->output(0)->data.f[0];
+  float aeResult = autoencoderInterpreter->output(0)->data.f[0];
+
+  // LCD
+  My_LCD.clear();
+  My_LCD.setCursor(0, 0);
+  My_LCD.print(classLabel);
+  My_LCD.setCursor(0, 1);
+  My_LCD.print("PPM:");
+  if (strcmp(classLabel, "CO") == 0) My_LCD.print(CO, 0);
+  else if (strcmp(classLabel, "Alcohol") == 0) My_LCD.print(Alcohol, 0);
+  else if (strcmp(classLabel, "CO2") == 0) My_LCD.print(CO2, 0);
+  else if (strcmp(classLabel, "Ammonia") == 0) My_LCD.print(NH3, 0);
+  else if (strcmp(classLabel, "Benzene") == 0) My_LCD.print(Benzene, 0);
+  else if (strcmp(classLabel, "VOC") == 0 || strcmp(classLabel, "VOC") == 0) My_LCD.print(VOC, 0);
+  else My_LCD.print("?");
+
+  DateTime now = rtc.now();
+
+  // Log to SD
+  myFile = SD.open("synthetic_mq135_gas_data.csv", FILE_APPEND);
+  myFile.printf("%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%s,%.2f,%.2f\n",
+    CO, Alcohol, CO2, Benzene, NH3, VOC, classLabel, regressionResult, aeResult);
+  myFile.close();
+
+  // Send to Losant
+  if (millis() - lastSendTime > sendInterval) {
+    lastSendTime = millis();
+    String payload = "{";
+    payload += "\"time\":\"" + String(now.timestamp()) + "\",";
+    payload += "\"CO\":" + String(CO) + ",";
+    payload += "\"Alcohol\":" + String(Alcohol) + ",";
+    payload += "\"CO2\":" + String(CO2) + ",";
+    payload += "\"Benzen\":" + String(Benzene) + ",";
+    payload += "\"NH3\":" + String(NH3) + ",";
+    payload += "\"VOC\":" + String(VOC) + ",";
+    payload += "\"Temperature\":" + String(temperature) + ",";
+    payload += "\"Humidity\":" + String(humidity) + ",";
+    payload += "\"Class\":\"" + String(classLabel) + "\",";
+    payload += "\"Regression\":" + String(regressionResult) + ",";
+    payload += "\"AE\":" + String(aeResult);
+    payload += "}";
+
+    String topic = "losant/" + String(LOSANT_DEVICE_ID) + "/state";
+    mqttClient.publish(topic.c_str(), ("{\"data\":" + payload + "}").c_str());
+  }
+
+   // Gas warning by classification
+   bool danger = (strcmp(classLabel, "Ammonia") == 0 && NH3 > 300) ||
+                 (strcmp(classLabel, "Smoke") == 0 && CO2 > 50000) ||
+                 (strcmp(classLabel, "CO") == 0 && CO > 500) ||
+                 (strcmp(classLabel, "Alcohol") == 0 && Alcohol > 400) ||
+                 (strcmp(classLabel, "Benzene") == 0 && Benzene > 500) ||
+                 (strcmp(classLabel, "CO2") == 0 && CO2 > 40000) ||
+                 (strcmp(classLabel, "VOC") == 0 && VOC > 1000);
+if (danger) {
+
+  if (CO > 500 || NH3 > 300 || Alcohol > 400 || CO2 > 40000 || Benzene > 500 || VOC > 1000) {
+    tone(buzzerPin, 180, 50);
+    digitalWrite(bluePin, LOW);
+    digitalWrite(redPin, HIGH);
+  } else {
+    noTone(buzzerPin);
+    digitalWrite(bluePin, HIGH);
+    digitalWrite(redPin, LOW);
+  }
+
+  delay(500);
+}

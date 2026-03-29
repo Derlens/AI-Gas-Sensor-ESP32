@@ -1,0 +1,497 @@
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+
+// WiFi and Losant 
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+const char* WIFI_SSID = "RafHive";
+const char* WIFI_PASSWORD = "thecatshowlatmidnight";
+const char* LOSANT_DEVICE_ID = "67bd0ffa3f887ddff7825328";
+const char* LOSANT_ACCESS_KEY = "7facce4e-3a59-42db-8cd3-e762afc819ee";
+const char* LOSANT_ACCESS_SECRET = "c0d758940a7d053d25e4ca9be95653b031f3b75c1dcacd0ddcfc1b12052eab28";
+
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+
+/*
+ https://www.electronicwings.com/
+  SD Card Interface code for ESP32
+  SPI Pins of ESP32 SD card as follows:
+  CS    = 5;
+  MOSI  = 23;
+  MISO  = 19;
+  SCK   = 18; 
+*/
+
+#include <SPI.h>
+#include <SD.h>
+#include <MQUnifiedsensor.h>
+
+
+/****************************AI Headers**********************************/
+#include <autoencoder_model_data.h>
+#include <classification_model_data.h>
+#include <regression_model_data.h>
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+
+/*AI variables & Functions*/
+float classificationOutput[1];
+float classificationInput[1];
+float regressionInput[1];
+float regressionOutput[1];
+float autoencoderInput[1];
+float autoencoderOutput[1];
+constexpr int kTensorArenaSize = 10 * 1024;  // Adjust size as needed
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];  // Memory for tensors
+
+tflite::MicroInterpreter* classificationInterpreter;
+tflite::MicroInterpreter* regressionInterpreter;
+tflite::MicroInterpreter* autoencoderInterpreter;
+
+
+void setupClassificationModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+  resolver.AddLogistic();
+  
+  const tflite::Model* model = tflite::GetModel(classification_model_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+      Serial.println("Model schema version mismatch!");
+      return;
+  }
+
+  classificationInterpreter = new tflite::MicroInterpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+  
+      classificationInterpreter->AllocateTensors();
+}
+
+void setupRegressionModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+
+  const tflite::Model* model = tflite::GetModel(regression_model_tflite);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.println("Model schema version mismatch!");
+        return;
+    }
+
+    regressionInterpreter = new tflite::MicroInterpreter(
+        model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+
+  regressionInterpreter->AllocateTensors();
+}
+
+void setupAutoencoderModel() {
+  static tflite::MicroErrorReporter error_reporter;
+  static tflite::MicroMutableOpResolver<6> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+  
+  const tflite::Model* model = tflite::GetModel(autoencoder_model_tflite);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.println("Model schema version mismatch!");
+        return;
+    }
+
+     autoencoderInterpreter = new tflite::MicroInterpreter(
+        model, resolver, tensor_arena, kTensorArenaSize, &error_reporter);
+
+  autoencoderInterpreter->AllocateTensors();
+}
+
+
+
+/*~~~~~~~~~~~Sensor Pins~~~~~~~~~*/
+const int buzzerPin = 4;
+const int redPin = 33;
+const int bluePin = 32;
+const int selButton = 25;
+const int upButton = 26;
+const int downButton  =27;
+int menuState = 0;
+int menuLast = -1;
+bool inOptionsMenu = false;
+int optionState = 0;
+bool ledOn = true;
+bool buzzerOn = false;
+
+File myFile;
+const int CS = 5;
+
+#define placa "ESP32"
+#define Voltage_Resolution 5
+#define pin 34 //Analog input 0 of your arduino
+#define type "MQ-135" //MQ135
+#define ADC_Bit_Resolution 12 // For arduino UNO/MEGA/NANO/ 12 for ESP32
+#define RatioMQ135CleanAir 3.6//RS / R0 = 3.6 ppm  
+MQUnifiedsensor MQ135(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, type);
+
+// Create An LCD Object. Signals: [ RS GREEN, EN WHITE, D4 YELLOW, D5 GREY, D6 orange, D7 PURPLE]
+//LiquidCrystal My_LCD(13, 12, 14, 27, 26, 25); 
+
+//Gray, Red, Yellow, Green
+LiquidCrystal_I2C My_LCD(0x27, 16, 2); // I2C address 0x27, 16 column and 2 rows
+
+// ~~~~~~~~~~~~~~~~~~~~~Connect to Losant Function~~~~~~~~~~~~~~~~~~~~~~~~~~
+void connectToLosant() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" Connected!");
+
+  secureClient.setInsecure();  // Use for testing. Replace with certificate verification in production.
+  mqttClient.setServer("broker.losant.com", 8883);
+
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to Losant...");
+    if (mqttClient.connect(LOSANT_DEVICE_ID, LOSANT_ACCESS_KEY, LOSANT_ACCESS_SECRET)) {
+      Serial.println(" Connected to Losant!");
+    } else {
+      Serial.print(" Failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Retrying...");
+      delay(2000);
+    }
+  }
+} //~~~~~~~~~~~~~~~~~~~~~~~~~~~~end of function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 1000; // 1 second
+
+void setup() {
+
+  My_LCD.init();
+  My_LCD.backlight();
+  My_LCD.clear();
+  My_LCD.print("Initializing");
+  My_LCD.setCursor(0, 1);
+  My_LCD.print("GSW-01...");
+
+  Serial.begin(9600);    // Set serial baud rate to 9600
+  delay(500);
+  while (!Serial) { ; }  // wait for serial port to connect. Needed for native USB port only
+  
+  connectToLosant(); //~~~~~~~~~~~~Calls connectToLosant function
+
+  Serial.println("Initializing SD card...");
+  if (!SD.begin(CS)) {
+    Serial.println("initialization failed!");
+    return;
+  }
+  Serial.println("initialization done.");
+  
+  myFile = SD.open("/GSWdata.txt", FILE_WRITE);
+  myFile.println("CO, Alcohol, CO2, Toluene, NH4, Acetone");
+  myFile.close();
+
+  //Set math model to calculate the PPM concentration and the value of constants
+  MQ135.setRegressionMethod(1); //_PPM =  a*ratio^b
+  MQ135.setA(102.2); MQ135.setB(-2.473); // Configure the equation to to calculate NH4 concentration
+  MQ135.init(); 
+  float calcR0 = 0;
+  for(int i = 1; i<=10; i ++)
+  {
+    MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+    calcR0 += MQ135.calibrate(RatioMQ135CleanAir);
+    // Serial.print(".");
+  }
+  MQ135.setR0(calcR0/10);
+
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+
+  //Menu buttons initialization
+  pinMode(upButton, INPUT_PULLUP);
+  pinMode(downButton, INPUT_PULLUP);
+  pinMode(selButton, INPUT_PULLUP);
+
+  digitalWrite(bluePin, HIGH);
+  digitalWrite(redPin, HIGH);
+  tone(buzzerPin, 180, 500);
+  delay(500);
+  noTone(buzzerPin); // Stop tone after initial beep
+  digitalWrite(redPin, LOW);
+
+}
+
+
+void loop() {
+
+
+  MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+
+  MQ135.setA(605.18); MQ135.setB(-3.937); // Configure the equation to calculate CO concentration value
+  float CO = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(77.255); MQ135.setB(-3.18); //Configure the equation to calculate Alcohol concentration value
+  float Alcohol = MQ135.readSensor(); // SSensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(110.47); MQ135.setB(-2.862); // Configure the equation to calculate CO2 concentration value
+  float CO2 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  CO2 = CO2 + 400; //Assumes CO2 atmosphere is at least 400ppm
+
+  MQ135.setA(44.947); MQ135.setB(-3.445); // Configure the equation to calculate Toluen concentration value
+  float Toluen = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  
+  MQ135.setA(102.2 ); MQ135.setB(-2.473); // Configure the equation to calculate NH4 concentration value
+  float NH4 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  MQ135.setA(34.668); MQ135.setB(-3.369); // Configure the equation to calculate Aceton concentration value
+  float Aceton = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+
+  myFile = SD.open("/GSWdata.txt", FILE_APPEND);
+  myFile.print(CO);
+  myFile.print(", ");
+  myFile.print(Alcohol);
+  myFile.print(", ");
+  myFile.print(CO2);
+  myFile.print(", ");
+  myFile.print(Toluen);
+  myFile.print(", ");
+  myFile.print(NH4);
+  myFile.print(", ");
+  myFile.println(Aceton);
+  myFile.close();
+
+  
+
+  int upMenu = !digitalRead(upButton);
+  int downMenu = !digitalRead(downButton);
+  int selMenu = !digitalRead(selButton);
+
+  if(!inOptionsMenu) {
+    if (downMenu) {
+      menuState++;
+      delay(200);
+    }
+    else if (upMenu) {
+      menuState--;
+      delay(200);
+    }
+    else if (selMenu) {
+      inOptionsMenu = true;
+      optionState = 0;
+      delay(200);
+    }
+  
+    if (menuState > 5) {
+      menuState = 0;
+    }
+    else if (menuState < 0) {
+      menuState = 5;
+    }
+
+    //default screen
+    //if (menuState != menuLast) {
+      My_LCD.clear();
+      switch (menuState) {
+        case 0:
+          My_LCD.setCursor(0, 0);
+          My_LCD.print("CO: ");
+          My_LCD.print(CO);
+          My_LCD.print("ppm");
+          My_LCD.setCursor(0, 1);
+          My_LCD.print("Alcohol: ");
+          My_LCD.print(Alcohol);
+          My_LCD.print("ppm");
+          break;
+        case 1:
+          My_LCD.setCursor(0, 0);
+          My_LCD.print("Alcohol: ");
+          My_LCD.print(Alcohol);
+          My_LCD.print("ppm");
+          My_LCD.setCursor(0, 1);
+          My_LCD.print("CO2: ");
+          My_LCD.print(CO2);
+          My_LCD.print("ppm");
+          break;
+        case 2:
+          My_LCD.setCursor(0, 0);
+          My_LCD.print("CO2: ");
+          My_LCD.print(CO2);
+          My_LCD.print("ppm");
+          My_LCD.setCursor(0, 1);
+          My_LCD.print("Toluene: ");
+          My_LCD.print(Toluen);
+          My_LCD.print("ppm");
+          break;
+        case 3:
+          My_LCD.setCursor(0, 0);
+          My_LCD.print("Toluene: ");
+          My_LCD.print(Toluen);
+          My_LCD.print("ppm");
+          My_LCD.setCursor(0, 1);
+          My_LCD.print("NH4: ");
+          My_LCD.print(NH4);
+          My_LCD.print("ppm");
+          break;
+        case 4:
+          My_LCD.setCursor(0, 0);
+          My_LCD.print("NH4: ");
+          My_LCD.print(NH4);
+          My_LCD.print("ppm");
+          My_LCD.setCursor(0, 1);
+          My_LCD.print("Acetone: ");
+          My_LCD.print(Aceton);
+          My_LCD.print("ppm");
+          break;
+        case 5:
+          My_LCD.setCursor(0, 0);
+          My_LCD.print("Acetone: ");
+          My_LCD.print(Aceton);
+          My_LCD.print("ppm");
+          My_LCD.setCursor(0, 1);
+          My_LCD.print("CO: ");
+          My_LCD.print(CO);
+          My_LCD.print("ppm");
+          break;
+      }
+    //  menuLast = menuState;
+   // }
+  }
+
+  //options menu
+  else {
+    if (upMenu) {
+      optionState--;
+      if(optionState < 0) {
+        optionState = 2;
+        delay(200);
+      }
+    }
+    else if(downMenu) {
+      optionState++;
+      if(optionState > 2) {
+        optionState = 0;
+        delay(200);
+      }
+    }
+    else if(selMenu) {
+    switch (optionState) {
+      case 0:
+        ledOn = !ledOn;
+        digitalWrite(redPin, ledOn ? HIGH : LOW);
+        digitalWrite(bluePin, ledOn ? HIGH : LOW);
+        break;
+      case 1:
+        buzzerOn = !buzzerOn;
+        if (buzzerOn) {
+          tone(buzzerPin, 200);
+        }
+        else {
+          noTone(buzzerPin);
+        }
+        break;
+      case 2:
+        inOptionsMenu = false;
+        menuState = 0;
+        menuLast = -1;
+        break;
+    }
+    delay(200);
+    }
+    My_LCD.clear();
+    if (optionState == 0) {
+      My_LCD.setCursor(0, 0); 
+      My_LCD.print(">LEDs: "); 
+      My_LCD.print(ledOn ? "ON" : "OFF");
+      My_LCD.setCursor(0, 1); 
+      My_LCD.print(" Buzzer: "); 
+      My_LCD.print(buzzerOn ? "ON" : "OFF");
+    } else if (optionState == 1) {
+      My_LCD.setCursor(0, 0); 
+      My_LCD.print(" LEDs: "); 
+      My_LCD.print(ledOn ? "ON" : "OFF");
+      My_LCD.setCursor(0, 1); 
+      My_LCD.print(">Buzzer: "); 
+      My_LCD.print(buzzerOn ? "ON" : "OFF");
+    } else if (optionState == 2) {
+      My_LCD.setCursor(0, 0); 
+      My_LCD.print(" Buzzer: "); 
+      My_LCD.print(buzzerOn ? "ON" : "OFF");
+      My_LCD.setCursor(0, 1);
+      My_LCD.print(">Exit");
+    }
+  }
+
+  mqttClient.loop();  // Maintain connection
+/*LOSANT HERE******************************/
+  if (millis() - lastSendTime > sendInterval) {
+    lastSendTime = millis();
+
+  
+    String payload = "{";
+    payload += "\"CO\":" + String(CO) + ",";
+    payload += "\"Alcohol\":" + String(Alcohol) + ",";
+    payload += "\"CO2\":" + String(CO2) + ",";  // Offset applied
+    payload += "\"Toluene\":" + String(Toluen) + ",";
+    payload += "\"NH4\":" + String(NH4) + ",";
+    payload += "\"Acetone\":" + String(Aceton);
+    payload += "}";
+
+    // Topic format: losant/<device-id>/state
+    String topic = "losant/" + String(LOSANT_DEVICE_ID) + "/state";
+
+    // Wrap payload in Losant format
+    String losantPayload = "{\"data\":" + payload + "}";
+
+    // Send to Losant
+
+    if (!mqttClient.connected()) {
+      connectToLosant();
+    }
+
+
+    mqttClient.publish(topic.c_str(), losantPayload.c_str());
+    Serial.println("Published to Losant: " + losantPayload);
+  }
+/*****************************************************/
+
+/*------------Trigger Alarm-------------------*/
+  if (CO > 500 || NH4 > 300 || Alcohol > 400 || CO2 > 40000 || Toluen > 500 || Aceton > 1000) {
+    if (buzzerOn) {
+      tone(buzzerPin, 180, 50);
+    }
+    else {
+      noTone(buzzerPin);
+    }
+    if (ledOn) {
+      digitalWrite(bluePin, LOW);
+      digitalWrite(redPin, HIGH);
+    }
+    else {
+      digitalWrite(bluePin, LOW);
+      digitalWrite(redPin, LOW);
+    }
+  }
+  else {
+    noTone(buzzerPin);
+    if (ledOn) {
+      digitalWrite(bluePin, HIGH);
+      digitalWrite(redPin, LOW);
+    }
+    else {
+      digitalWrite(bluePin, LOW);
+      digitalWrite(redPin, LOW);
+    }
+  }
+  
+  delay(250);
+}
